@@ -30,6 +30,7 @@ generate Config {..} spec = do
   LT.writeFile "types.py" $ templ configFilePath [lt|
 import sys
 import msgpack
+import mpidl
 
 #{LT.concat $ map (genTypeDecl "") spec }
 |]
@@ -43,6 +44,7 @@ from types import *
 
   LT.writeFile "client.py" $ templ configFilePath [lt|
 import msgpackrpc
+import mpidl
 from types import *
 
 #{LT.concat $ map (genClient) spec}
@@ -65,12 +67,20 @@ genTypeDecl _ MPException {..} =
 
 genTypeDecl _ _ = ""
 
+genUnused :: Int -> T.Text
+genUnused i = "_UNUSED" `mappend` T.pack (show i)
+
+genUserDefArgs :: (Int -> T.Text) -> [Field] -> [T.Text]
+genUserDefArgs unused flds = zipWith (\ix -> maybe (unused ix) fldName) [0 .. ] (sortField flds)
+
+genArgs :: [T.Text] -> T.Text
+genArgs = T.intercalate ", "
+
 genMsg :: ToText a => a -> [Field] -> Bool -> LT.Text
 genMsg name flds isExc =
-  let fs = zipWith (\ix -> maybe ("_UNUSED" `mappend` T.pack (show ix)) fldName) [0 .. ] (sortField flds)
-  in [lt|
+  [lt|
 class #{name}#{e}:
-  def __init__(self, #{LT.intercalate ", " $ map g fs}):
+  def __init__(#{genArgs initArgs}):
 #{LT.concat $ map f flds}
   def to_msgpack(self):
     return (#{LT.concat $ map typ flds}
@@ -78,20 +88,21 @@ class #{name}#{e}:
 
   @staticmethod
   def from_msgpack(arg):
-    return #{name}(
-      #{LT.intercalate ",\n      " $ map make_arg flds})
+    [#{genArgs $ map fldName flds}] = #{fromMsgpack (TTuple $ map fldType flds) "arg"}
+    return #{name}(#{genArgs vs})
 |]
 
   where
     e = if isExc then [lt|(Exception)|] else ""
+    fs = genUserDefArgs genUnused flds
+    vs = genUserDefArgs (\_ -> T.pack "None") flds
+    initArgs = T.pack "self" : fs
     f Field {..} = [lt|    self.#{fldName} = #{fldName}
 |]
-    typ Field {..} = [lt|
-      self.#{fldName},|]
-    make_arg Field {..} =
-      let fldId_str = T.concat $ map T.pack ["arg[", (show fldId), "]"] in
-      [lt|#{fromMsgpack fldType fldId_str}|]
-    g str = [lt|#{str}|]
+    typ Field {..} = 
+      let var = "self." `mappend` fldName in
+      [lt|
+      #{toMsgpack fldType var},|]
 
 sortField :: [Field] -> [Maybe Field]
 sortField flds =
@@ -108,60 +119,49 @@ class #{serviceName}:
 |]
   where
   genMethodCall Function {..} =
-    let arg_list = zipWith (\ix -> maybe ("_UNUSED" `mappend` T.pack (show ix)) fldName) [0 .. ] $ sortField methodArgs
-        args = LT.concat $ map (\x -> [lt|, #{x}|]) arg_list
-    in
     case methodRetType of
       Nothing -> [lt|
-  def #{methodName} (self#{args}):
-    self.client.call('#{methodName}'#{args})
+  def #{methodName} (#{genArgs args}):
+    self.client.call(#{genArgs vals})
 |]
       Just ts -> [lt|
-  def #{methodName} (self#{args}):
-    retval = self.client.call('#{methodName}'#{args})
+  def #{methodName} (#{genArgs args}):
+    retval = self.client.call(#{genArgs vals})
     return #{fromMsgpack ts "retval"}
 |]
+    where 
+      args = T.pack "self" : genUserDefArgs genUnused methodArgs
+      method = [lt|'#{methodName}'|]
+      vals = map (T.pack . LT.unpack) $ method : (map genVal methodArgs)
+      genVal Field {..} = toMsgpack fldType fldName
 
   genMethodCall _ = ""
 
 genClient _ = ""
 
-sanitize :: Char -> Char
-sanitize '[' = '_'
-sanitize ']' = '_'
-sanitize c = c
+boolToText :: Bool -> LT.Text
+boolToText True = "True"
+boolToText False = "False"
+
+typeObject :: Type -> LT.Text
+typeObject (TInt signed bits) = [lt|mpidl.TInt(#{boolToText signed}, #{show bits})|]
+typeObject (TFloat _) = "mpidl.TFloat()"
+typeObject TBool = "mpidl.TBool()"
+typeObject TString = "mpidl.TString()"
+typeObject (TNullable t) = [lt|mpidl.TNullable(#{typeObject t})|]
+typeObject (TList t) = [lt|mpidl.TList(#{typeObject t})|]
+typeObject (TMap t1 t2) = [lt|mpidl.TMap(#{typeObject t1}, #{typeObject t2})|]
+typeObject (TTuple ts) =
+  [lt|mpidl.TTuple([#{LT.intercalate ", " $ map typeObject ts}])|]
+typeObject (TUserDef className _) = [lt|mpidl.TUserDef(#{className})|]
+typeObject TObject = "mpidl.TObject()"
+typeObject TRaw = "mpidl.TRaw()"
+
+toMsgpack :: Type -> T.Text -> LT.Text
+toMsgpack typ name = [lt|#{typeObject typ}.to_msgpack(#{name})|]
 
 fromMsgpack :: Type -> T.Text -> LT.Text
-fromMsgpack (TNullable t) name = fromMsgpack t name
-fromMsgpack (TInt _ _) name = [lt|#{name}|]
-fromMsgpack (TFloat False) name = [lt|#{name}|]
-fromMsgpack (TFloat True) name = [lt|#{name}|]
-fromMsgpack TBool name = [lt|#{name}|]
-fromMsgpack TRaw name = [lt|#{name}|]
-fromMsgpack TString name = [lt|#{name}|]
-fromMsgpack (TList typ) name =
-  let
-    varname = T.append (T.pack "elem_") (T.map sanitize name) in
-  [lt|[#{fromMsgpack typ varname} for #{varname} in #{name}]|]
-
-fromMsgpack (TMap typ1 typ2) name =
-  let
-    keyname = T.append (T.pack "k_" ) $ T.map sanitize name
-    valname = T.append (T.pack "v_" ) $ T.map sanitize name
-  in
-  [lt|{#{fromMsgpack typ1 keyname} : #{fromMsgpack typ2 valname} for #{keyname},#{valname} in #{name}.items()}|]
-
-fromMsgpack (TUserDef className _) name = [lt|#{className}.from_msgpack(#{name})|]
-            
-fromMsgpack (TTuple ts) name =
-            let elems = map (f name) (zip [0..] ts) in
-            [lt| (#{LT.intercalate ", " elems}) |]
-            where
-              f :: T.Text -> (Integer, Type) -> LT.Text
-              f n (i, (TUserDef className _ )) = [lt|#{className}.from_msgpack(#{n}[#{show i}]) |]
-              f n (i, _) = [lt|#{n}[#{show i}]|]
-
-fromMsgpack TObject name = [lt|#{name}|]
+fromMsgpack typ name = [lt|#{typeObject typ}.from_msgpack(#{name})|]
 
 templ :: FilePath -> LT.Text -> LT.Text
 templ filepath content = [lt|
